@@ -1,6 +1,8 @@
 from polygon import RESTClient
+from langchain_core.tools import tool
 
 client = RESTClient(api_key="doYsnLZqJmyklTl8ifPYqCGhJqaYvhyR")
+
 
 news_articles = client.list_ticker_news(
 	"AAPL",
