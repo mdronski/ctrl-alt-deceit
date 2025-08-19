@@ -10,7 +10,7 @@ uv sync
 ```
 
 ## Configure env variables
-Create local *.env* file and define API ekys env variables there
+Create local *.env* file and define API keys env variables there
 
 ## Run application
 

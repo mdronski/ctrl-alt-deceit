@@ -639,6 +639,7 @@ dependencies = [
     { name = "langchain-tavily" },
     { name = "langgraph" },
     { name = "notebook" },
+    { name = "python-dotenv" },
     { name = "tavily-python" },
 ]
 
@@ -654,6 +655,7 @@ requires-dist = [
     { name = "langchain-tavily", specifier = ">=0.2.11" },
     { name = "langgraph", specifier = ">=0.6.4" },
     { name = "notebook", specifier = ">=7.4.5" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "tavily-python", specifier = ">=0.7.10" },
 ]
 
