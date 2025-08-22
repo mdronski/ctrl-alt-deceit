@@ -1,71 +1,57 @@
-api_key = "d2ja7o1r01qqoajabc60d2ja7o1r01qqoajabc6g"    
+import datetime
 import requests
-from datetime import date, timedelta
 from transformers import pipeline
+from langchain.tools import tool
 
- 
-api_key = "d2ja7o1r01qqoajabc60d2ja7o1r01qqoajabc6g"    
-symbol = "INFY"            
-
- 
-to_date = date.today()
-from_date = to_date - timedelta(days=365)
-
-url = "https://finnhub.io/api/v1/company-news"
-params = {
-    "symbol": symbol,
-    "from": from_date.isoformat(),
-    "to": to_date.isoformat(),
-    "token": api_key
-}
-
-print(f"Fetching news for {symbol} ({from_date} → {to_date})...")
-r = requests.get(url, params=params)
-
- 
 classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-if r.status_code == 200:
-    articles = r.json()
+API_KEY = "d2ja7o1r01qqoajabc60d2ja7o1r01qqoajabc6g"
 
+@tool
+def finnhub_tool(symbol: str) -> str:
+    """
+    Fetch the latest news articles for a stock symbol using Finnhub, and return titles, sources, dates, URLs, and sentiment.
+    """
+    to_date = datetime.date.today()
+    from_date = to_date - datetime.timedelta(days=365)
+
+    url = "https://finnhub.io/api/v1/company-news"
+    params = {
+        "symbol": symbol.upper(),
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+        "token": API_KEY
+    }
+
+    response = requests.get(url, params=params)
+
+    if response.status_code != 200:
+        return f"Error fetching data from Finnhub: {response.status_code} - {response.text}"
+
+    articles = response.json()
     if not articles:
-        print("No news found :(")
-    else:
-        sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+        return f"No articles found for {symbol}."
 
-        print(f"\nFound {len(articles)} articles:\n")
+    report = []
+    for article in articles[:5]:  # limit to latest 5 for brevity
+        title = article.get("headline")
+        summary = article.get("summary", "")
+        content = f"{title}. {summary}"
+        source = article.get("source", "Unknown")
+        date = article.get("datetime")
+        url = article.get("url")
 
-        for i, art in enumerate(articles, start=1):
-            headline = art.get("headline", "")
-            summary = art.get("summary", "")
-            text = headline + " " + summary
+        # Run FinBERT sentiment
+        result = classifier(content[:512])
+        sentiment = result[0]["label"].capitalize()
 
-            
-            result = classifier(text[:512])  # FinBERT limit
-            sentiment = result[0]["label"].lower()
-            score = result[0]["score"]
+        report.append(
+            f"Title: {title}\n"
+            f"Source: {source}\n"
+            f"Date: {date}\n"
+            f"URL: {url}\n"
+            f"Sentiment: {sentiment}\n"
+            + "-" * 40
+        )
 
-            sentiment_counts[sentiment] += 1
-
-            print(f"{i}. {headline}")
-            print("   Source:", art.get("source"))
-            print("   Date:", art.get("datetime"))
-            print("   Link:", art.get("url"))
-            print("   Sentiment:", sentiment, f"(confidence {score:.2f})\n")
-
-        # ---- Statistics (ignoring neutral) ----
-        pos = sentiment_counts["positive"]
-        neg = sentiment_counts["negative"]
-        total = pos + neg
-
-        print("\n📊 Sentiment Statistics (excluding Neutral):")
-        if total > 0:
-            pos_perc = (pos / total) * 100
-            neg_perc = (neg / total) * 100
-            print(f"  Positive: {pos} ({pos_perc:.1f}%)")
-            print(f"  Negative: {neg} ({neg_perc:.1f}%)")
-        else:
-            print("  No positive or negative news found.")
-
-else:
-    print("Error:", r.status_code, r.text)
+    return "\n".join(report)

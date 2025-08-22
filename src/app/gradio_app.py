@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 
 from textblob import TextBlob
 
-from app.api.newsorgapi import fetch_news_with_sentiment
+from app.api.newsorgapi import newsapi_tool
+from app.api.finnhub import finnhub_tool
+from app.api.gnewsapi import gnews_tool
 
 load_dotenv()
 
@@ -19,14 +21,31 @@ from app.agent import agent
 # Functions
 # =========================
 
-def ask_agent(company_name: str) -> str:
+def ask_agent(company_name: str, rows: list[dict]) -> str:
     # TODO conduct valid prompt engineering
-    user_input = (
-        f"What are potential red flags about the company '{company_name}' "
-        f"as a potential business partner? "
-        f"Prepare a markdown summary. Provide links and information you got from tools."
+    """
+    Sends structured article data to the LLM agent for summarization.
+    """
+    if not rows:
+        return f"No articles found to analyze for {company_name}."
+
+    news_text = "\n".join(
+        f"- {r['date']} · {r['source']} — {r['title']} ({r['sentiment']})\n  {r['url']}"
+        for r in rows
     )
-    response = agent.invoke({"messages": user_input})
+
+    prompt = f"""
+                You are a due diligence analyst. Analyze the following recent news about the company '{company_name}'.
+                
+                Your task is to identify **potential red flags** that may affect business risk, reputation, legal issues, or compliance concerns.
+                
+                Here are the recent articles:
+                {news_text}
+                
+                Return your analysis as a **markdown-formatted summary**, grouped by issue type if possible. Highlight any concerns such as fraud, regulation, fines, lawsuits, etc.
+            """
+
+    response = agent.invoke({"messages": [{"role": "user", "content": prompt.strip()}]})
     return response["messages"][-1].content
 
 def _sentiment_label(text: str) -> str:
@@ -39,11 +58,55 @@ def _sentiment_label(text: str) -> str:
         return "Negative"
     return "Neutral"
 
+def fetch_news_combined(company: str):
+    """
+    Fetches news from NewsAPI, GNews, and Finnhub.
+    Returns a unified list of dicts and an optional error message.
+    """
+    tools = [newsapi_tool, gnews_tool, finnhub_tool]
+    articles_all = []
+    errors = []
+
+    for tool_fn in tools:
+        try:
+            result = tool_fn(company)
+            if "No articles found" in result:
+                continue
+
+            # Split by separator line
+            articles = result.split("-" * 40)
+            for a in articles:
+                if not a.strip():
+                    continue
+                lines = a.strip().split("\n")
+                d = {}
+                for line in lines:
+                    if line.startswith("Title:"):
+                        d["title"] = line.replace("Title:", "").strip()
+                    elif line.startswith("Source:"):
+                        d["source"] = line.replace("Source:", "").strip()
+                    elif line.startswith("Date:"):
+                        d["date"] = line.replace("Date:", "").strip()[:10]
+                    elif line.startswith("URL:"):
+                        d["url"] = line.replace("URL:", "").strip()
+                    elif line.startswith("Sentiment:"):
+                        d["sentiment"] = line.replace("Sentiment:", "").strip()
+                if d:
+                    articles_all.append(d)
+        except Exception as e:
+            errors.append(f"{tool_fn.__name__} failed: {str(e)}")
+
+    if not articles_all:
+        return [], "No articles found from any source." + (f" Errors: {errors}" if errors else "")
+
+    return articles_all, None
+
+
 def fetch_news(company: str):
     """
     Calls fetch_news_with_sentiment() and returns list of dicts for Gradio table.
     """
-    report_str = fetch_news_with_sentiment(company)
+    report_str = newsapi_tool(company)
     if "No articles found" in report_str:
         return [], "No articles found."
 
@@ -266,11 +329,12 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
 
     # -------- logic
     def analyze(company: str):
-        # 1) LLM summary
-        summary = ask_agent(company)
+        # Fetch news
+        rows, err = fetch_news_combined(company)
 
-        # 2) News + sentiment
-        rows, err = fetch_news(company)
+        # LLM summary
+        summary = ask_agent(company, rows)
+
         if err:
             pie_path = None
             timeline = f"_News error_: {err}"

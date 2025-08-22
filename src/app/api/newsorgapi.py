@@ -17,7 +17,7 @@ def get_sentiment(text: str) -> str:
         return "Neutral"
 
 @tool
-def fetch_news_with_sentiment(query: str) -> str:
+def newsapi_tool(query: str) -> str:
     """
     Fetch the latest news articles for a company or keyword and return titles, sources, dates, URLs, and sentiment.
     """

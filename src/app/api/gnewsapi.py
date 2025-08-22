@@ -1,78 +1,64 @@
 import requests
+from langchain.tools import tool
 from transformers import pipeline
-
-
-api_key = "7642ab5e95effb7866058ed237ba83d5" 
-search = "HSBC"  
-
-url = "https://gnews.io/api/v4/search"
-
 
 classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
+GNEWS_API_KEY = "7642ab5e95effb7866058ed237ba83d5"
 
-all_articles = []
-pages_to_fetch = 5   
+@tool
+def gnews_tool(query: str) -> str:
+    """
+    Fetch the latest news articles for a keyword or company using GNews API and return titles, sources, dates, URLs, and sentiment.
+    """
+    url = "https://gnews.io/api/v4/search"
+    all_articles = []
+    pages_to_fetch = 2
 
-for page in range(1, pages_to_fetch + 1):
-    params = {
-        "q": search,
-        "lang": "en",
-        "max": 10,     
-        "page": page,
-        "sortby": "publishedAt",
-        "token": api_key
-    }
+    for page in range(1, pages_to_fetch + 1):
+        params = {
+            "q": query,
+            "lang": "en",
+            "max": 10,
+            "page": page,
+            "sortby": "publishedAt",
+            "token": GNEWS_API_KEY
+        }
 
-    print(f"Fetching page {page}...")
-    r = requests.get(url, params=params)
+        r = requests.get(url, params=params)
+        if r.status_code != 200:
+            return f"Error fetching data from GNews: {r.status_code} - {r.text}"
 
-    if r.status_code == 200:
         data = r.json()
         articles = data.get("articles", [])
         if not articles:
             break  # stop if no more results
         all_articles.extend(articles)
-    else:
-        print("Error:", r.status_code, r.text)
-        break
 
-print(f"\n✅ Total articles collected: {len(all_articles)}\n")
+    if not all_articles:
+        return f"No articles found for '{query}'."
 
-
-if not all_articles:
-    print("No news found :(")
-else:
-    sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
-
-    for i, art in enumerate(all_articles, start=1):
-        title = art["title"]
+    report = []
+    for art in all_articles[:5]:  # limit to latest 5 for concise output
+        title = art.get("title", "No Title")
         description = art.get("description", "")
-        text = title + " " + description 
+        text = f"{title}. {description}".strip()
 
+        source = art.get("source", {}).get("name", "Unknown")
+        date = art.get("publishedAt", "Unknown")
+        url = art.get("url", "#")
 
+        # Sentiment Analysis with FinBERT
         result = classifier(text[:512])
-        sentiment = result[0]["label"].lower()
-        score = result[0]["score"]
+        sentiment = result[0]["label"].capitalize()
 
-        sentiment_counts[sentiment] += 1
+        report.append(
+            f"Title: {title}\n"
+            f"Source: {source}\n"
+            f"Date: {date}\n"
+            f"URL: {url}\n"
+            f"Sentiment: {sentiment}\n"
+            + "-" * 40
+        )
 
-        print(f"{i}. {title}")
-        print("   From:", art["source"]["name"])
-        print("   Date:", art["publishedAt"])
-        print("   Link:", art["url"])
-        print("   Sentiment:", sentiment, f"(confidence {score:.2f})\n")
-
-   
-    pos = sentiment_counts["positive"]
-    neg = sentiment_counts["negative"]
-    total = pos + neg
-
-    print("\n📊 Sentiment Statistics (excluding Neutral):")
-    if total > 0:
-        pos_perc = (pos / total) * 100
-        neg_perc = (neg / total) * 100
-        print(f"  Positive: {pos} ({pos_perc:.1f}%)")
-        print(f"  Negative: {neg} ({neg_perc:.1f}%)")
-    else:
-        print("  No positive or negative news found.")
+    return "\n".join(report)
