@@ -1,27 +1,14 @@
+import os
 from langchain.tools import tool
 from newsapi import NewsApiClient
-from textblob import TextBlob
-
-def get_sentiment(text: str) -> str:
-    if not text:
-        return "Neutral"
-
-    analysis = TextBlob(text)
-    polarity = analysis.sentiment.polarity
-
-    if polarity > 0.1:
-        return "Positive"
-    elif polarity < -0.1:
-        return "Negative"
-    else:
-        return "Neutral"
 
 @tool
 def newsapi_tool(query: str) -> str:
     """
-    Fetch the latest news articles for a company or keyword and return titles, sources, dates, URLs, and sentiment.
+    Fetch latest news articles for a query.
+    Returns raw article info (title, content, source, date, URL) for LLM analysis.
     """
-    api_key = "5a248d7325f64806988f558ace817e8f"
+    api_key = os.getenv("NEWSAPI_API_KEY")
     newsapi = NewsApiClient(api_key=api_key)
 
     response = newsapi.get_everything(
@@ -30,26 +17,25 @@ def newsapi_tool(query: str) -> str:
         sort_by="publishedAt",
         page_size=5,
     )
-
     articles = response.get("articles", [])
     if not articles:
         return f"No articles found for {query}."
 
     report = []
     for article in articles:
-        title = article.get("title")
-        content = article.get("content") or article.get("description")
+        title = article.get("title", "No Title")
+        description = article.get("description") or ""
+        content = f"{title}. {description}".strip()
         source = article.get("source", {}).get("name", "Unknown")
-        date = article.get("publishedAt")
-        url = article.get("url")
-        sentiment = get_sentiment(content)
+        date = article.get("publishedAt", "Unknown")
+        url = article.get("url", "#")
 
         report.append(
             f"Title: {title}\n"
             f"Source: {source}\n"
             f"Date: {date}\n"
             f"URL: {url}\n"
-            f"Sentiment: {sentiment}\n"
+            f"Content: {content}\n"
             + "-" * 40
         )
 

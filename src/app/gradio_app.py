@@ -1,70 +1,249 @@
-import os
+import hashlib
 import io
-import datetime
+import os
+import re
 import tempfile
-
-import matplotlib.pyplot as plt
+from datetime import datetime, timezone, date
+from difflib import SequenceMatcher
+from urllib.parse import urlparse
+from transformers import pipeline
 import gradio as gr
+import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 
-from textblob import TextBlob
-
-from app.api.newsorgapi import newsapi_tool
+from app.agent import agent
 from app.api.finnhub import finnhub_tool
 from app.api.gnewsapi import gnews_tool
+from app.api.newsorgapi import newsapi_tool
 
 load_dotenv()
-
-from app.agent import agent
+classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 # =========================
-# Functions
+# Keyword tiers (HARD/ MEDIUM / SOFT)
+# =========================
+
+HARD_KEYWORDS = {
+    # enforcement & criminal / insolvency
+    "fraud", "bribery", "embezzlement", "corruption", "money laundering", "aml",
+    "sanctions evasion", "insider trading",
+    "fine", "fines", "penalty", "penalties", "settlement",
+    "lawsuit", "litigation", "class action",
+    "indictment", "arrest", "criminal charges",
+    "bankruptcy", "insolvency", "collapse", "liquidation", "administration"
+}
+
+MEDIUM_KEYWORDS = {
+    # regulatory & supervisory without proven wrongdoing
+    "regulatory scrutiny", "regulator scrutiny", "scrutiny from regulators",
+    "regulatory probe", "probe", "investigation", "inquiry",
+    "supervisory review", "compliance review", "regulatory review",
+    "watchlist", "warning letter"
+}
+
+SOFT_NEGATIVE_TERMS = {
+    # business hygiene / strategy – should not be scandals by themselves
+    "revamp", "restructuring", "restructure", "layoffs", "job cuts", "headcount",
+    "exit clients", "client exits", "client offboarding", "offboarding",
+    "reorg", "re-organization", "guidance cut", "profit warning", "downgrade"
+}
+
+
+# =========================
+# Parsing / Normalization helpers
+# =========================
+
+def parse_to_utc(date_time_raw: str | None) -> datetime | None:
+    """
+        Parse to timezone-aware UTC datetime.
+    """
+    if not date_time_raw:
+        return None
+    try:
+        iso = str(date_time_raw).replace("Z", "+00:00")
+        d = datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        pass
+    try:
+        val = float(str(date_time_raw).strip())
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    except Exception:
+        pass
+    # yyyy-mm-dd
+    try:
+        d = datetime.strptime(str(date_time_raw)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return d
+    except Exception:
+        return None
+
+
+def normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", (title or "").lower())).strip()
+
+
+def title_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_title(a), normalize_title(b)).ratio()
+
+
+def url_key(url: str | None) -> str:
+    """Normalize URL to host + path (without query/fragment) for dedup."""
+    if not url:
+        return ""
+    try:
+        u = urlparse(url)
+        return f"{u.netloc.lower()}:{u.path}"
+    except Exception:
+        return url or ""
+
+
+def deduplicate_articles(articles: list[dict], similarity_threshold: float = 0.92) -> list[dict]:
+    """
+    Dedup by:
+      1) exact normalized title hash
+      2) same URL host+path
+      3) fuzzy title similarity across already-kept items
+    Keeps the first occurrence.
+    """
+    unique: list[dict] = []
+    seen_hashes = set()
+    seen_urls = set()
+
+    for art in articles:
+        t = art.get("title", "")
+        nk = normalize_title(t)
+        h = hashlib.md5(nk.encode()).hexdigest()
+        ukey = url_key(art.get("url"))
+
+        if h in seen_hashes or (ukey and ukey in seen_urls):
+            continue
+
+        is_dup = False
+        for u in unique:
+            if ukey and url_key(u.get("url")) == ukey:
+                is_dup = True
+                break
+            if title_similarity(t, u.get("title", "")) >= similarity_threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            seen_hashes.add(h)
+            if ukey:
+                seen_urls.add(ukey)
+            unique.append(art)
+
+    return unique
+
+
+def finbert_sentiment(text: str) -> str:
+    if not text:
+        return "Neutral"
+    result = classifier(text[:512])[0]["label"].lower()
+    return {"positive": "Positive", "negative": "Negative", "neutral": "Neutral"}.get(result, "Neutral")
+
+
+def adjust_sentiment(title: str, sentiment: str) -> str:
+    """
+    Downgrades "Negative" to "Neutral" for soft business terms (revamp/layoffs/etc).
+    Leaves true negatives as-is.
+    """
+    t = (title or "").lower()
+    if sentiment == "Negative" and any(term in t for term in SOFT_NEGATIVE_TERMS):
+        return "Neutral"
+    return sentiment
+
+
+def classify_article_level(title: str, body: str = "") -> str:
+    """
+    HARD: contains any HARD_KEYWORDS
+    MEDIUM: contains any MEDIUM_KEYWORDS (and no HARD)
+    SOFT: otherwise
+    """
+    t = f"{title or ''} {body or ''}".lower()
+    if any(k in t for k in HARD_KEYWORDS):
+        return "HARD"
+    if any(k in t for k in MEDIUM_KEYWORDS):
+        return "MEDIUM"
+    return "SOFT"
+
+
+def is_relevant(company: str, title: str, url: str, source: str) -> bool:
+    """
+    Keep only articles clearly about the target company to prevent pollution
+    (e.g., random 'GST buzz' pieces).
+    Rules:
+      - title contains the full company phrase, OR
+      - title contains any strong token from company name (>=3 chars), OR
+      - url host or path contains a strong token (handles tickers/brands in URLs)
+    """
+    if not company:
+        return True
+
+    full = company.strip().lower()
+    title_l = (title or "").lower()
+    if full and full in title_l:
+        return True
+
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", full) if len(tok) >= 3]
+    if tokens and any(tok in title_l for tok in tokens):
+        return True
+
+    try:
+        u = urlparse(url or "")
+        host_path = (u.netloc + u.path).lower()
+        if tokens and any(tok in host_path for tok in tokens):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# =========================
+# LLM summary
 # =========================
 
 def ask_agent(company_name: str, rows: list[dict]) -> str:
-    # TODO conduct valid prompt engineering
-    """
-    Sends structured article data to the LLM agent for summarization.
-    """
     if not rows:
         return f"No articles found to analyze for {company_name}."
 
     news_text = "\n".join(
-        f"- {r['date']} · {r['source']} — {r['title']} ({r['sentiment']})\n  {r['url']}"
-        for r in rows
+        f"- {row.get('date', '')} · {row.get('source', '')} — {row.get('title', '')} ({row.get('sentiment', '')})\n  {row.get('url', '')}"
+        for row in rows
     )
 
     prompt = f"""
-                You are a due diligence analyst. Analyze the following recent news about the company '{company_name}'.
-                
-                Your task is to identify **potential red flags** that may affect business risk, reputation, legal issues, or compliance concerns.
-                
-                Here are the recent articles:
-                {news_text}
-                
-                Return your analysis as a **markdown-formatted summary**, grouped by issue type if possible. Highlight any concerns such as fraud, regulation, fines, lawsuits, etc.
-            """
+    You are a due diligence analyst. Analyze recent news about '{company_name}'.
+    Identify **red flags** (fraud, AML/sanctions evasion, fines/penalties, settlements, lawsuits/litigation, indictments/arrests, bankruptcy/insolvency).
+    Treat **regulatory scrutiny/probes/inquiries** as **medium risk**, not scandals, unless tied to enforcement or fraud.
+    Treat **restructuring/layoffs/revamps/client offboarding** as **operational** unless combined with the above.
+    
+    Articles:
+    {news_text}
 
+    Do a web search to verify the articles and look for other potential risks about the company.
+    Return a concise **markdown summary** grouped by issue type.
+    """
     response = agent.invoke({"messages": [{"role": "user", "content": prompt.strip()}]})
     return response["messages"][-1].content
 
-def _sentiment_label(text: str) -> str:
-    if not text:
-        return "Neutral"
-    pol = TextBlob(text).sentiment.polarity
-    if pol > 0.1:
-        return "Positive"
-    if pol < -0.1:
-        return "Negative"
-    return "Neutral"
 
-def fetch_news_combined(company: str):
+# =========================
+# Fetch + normalize
+# =========================
+
+def fetch_news(company: str):
     """
-    Fetches news from NewsAPI, GNews, and Finnhub.
+    Retrieves news from NewsAPI, GNews, and Finnhub.
     Returns a unified list of dicts and an optional error message.
+    Applies relevance filtering and aggressive de-duplication.
     """
     tools = [newsapi_tool, gnews_tool, finnhub_tool]
-    articles_all = []
+    articles_all: list[dict] = []
     errors = []
 
     for tool_fn in tools:
@@ -73,125 +252,182 @@ def fetch_news_combined(company: str):
             if "No articles found" in result:
                 continue
 
-            # Split by separator line
             articles = result.split("-" * 40)
-            for a in articles:
-                if not a.strip():
+            for article in articles:
+                if not article.strip():
                     continue
-                lines = a.strip().split("\n")
-                d = {}
+                lines = [ln for ln in article.strip().split("\n") if ln.strip()]
+                record = {}
                 for line in lines:
                     if line.startswith("Title:"):
-                        d["title"] = line.replace("Title:", "").strip()
+                        record["title"] = line.replace("Title:", "").strip()
                     elif line.startswith("Source:"):
-                        d["source"] = line.replace("Source:", "").strip()
+                        record["source"] = line.replace("Source:", "").strip()
                     elif line.startswith("Date:"):
-                        d["date"] = line.replace("Date:", "").strip()[:10]
+                        record["date_raw"] = line.replace("Date:", "").strip()
+                        dt = parse_to_utc(record["date_raw"])
+                        record["date"] = dt.date().isoformat() if dt else ""
                     elif line.startswith("URL:"):
-                        d["url"] = line.replace("URL:", "").strip()
-                    elif line.startswith("Sentiment:"):
-                        d["sentiment"] = line.replace("Sentiment:", "").strip()
-                if d:
-                    articles_all.append(d)
+                        record["url"] = line.replace("URL:", "").strip()
+                    elif line.startswith("Content:"):
+                        record["content"] = line.replace("Content:", "").strip()
+
+                if not record:
+                    continue
+
+                # Relevance gate
+                if not is_relevant(company, record.get("title", ""), record.get("url", ""), record.get("source", "")):
+                    continue
+
+                # Sentiment
+                base_sent = finbert_sentiment(record.get("title", ""))
+
+                record["sentiment"] = adjust_sentiment(record.get("title", ""), base_sent)
+
+                level = classify_article_level(record.get("title", ""))
+
+                articles_all.append({
+                    "title": record.get("title", ""),
+                    "source": record.get("source", ""),
+                    "content": record.get("content", ""),
+                    "date": record.get("date", ""),
+                    "date_raw": record.get("date_raw", ""),
+                    "url": record.get("url", ""),
+                    "sentiment": record.get("sentiment", "Neutral"),
+                    "level": level,
+                })
+
         except Exception as e:
             errors.append(f"{tool_fn.__name__} failed: {str(e)}")
+
+    print(f"Total articles fetched: {len(articles_all)}")
 
     if not articles_all:
         return [], "No articles found from any source." + (f" Errors: {errors}" if errors else "")
 
+    # Deduplicate articles
+    articles_all = deduplicate_articles(articles_all)
+
+    print(f"Articles after deduplication: {len(articles_all)}")
+
     return articles_all, None
 
 
-def fetch_news(company: str):
-    """
-    Calls fetch_news_with_sentiment() and returns list of dicts for Gradio table.
-    """
-    report_str = newsapi_tool(company)
-    if "No articles found" in report_str:
-        return [], "No articles found."
-
-    # Split by article blocks
-    articles = report_str.split("-" * 40)
-    rows = []
-    for a in articles:
-        if not a.strip():
-            continue
-        lines = a.strip().split("\n")
-        d = {}
-        for line in lines:
-            if line.startswith("Title:"):
-                d["title"] = line.replace("Title:", "").strip()
-            elif line.startswith("Source:"):
-                d["source"] = line.replace("Source:", "").strip()
-            elif line.startswith("Date:"):
-                d["date"] = line.replace("Date:", "").strip()[:10]
-            elif line.startswith("URL:"):
-                d["url"] = line.replace("URL:", "").strip()
-            elif line.startswith("Sentiment:"):
-                d["sentiment"] = line.replace("Sentiment:", "").strip()
-        if d:
-            rows.append(d)
-    return rows, None
+# =========================
+# Visualization + timeline
+# =========================
 
 def make_sentiment_pie(rows):
-    # Count sentiments
     counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
-    for r in rows:
-        counts[r["sentiment"]] = counts.get(r["sentiment"], 0) + 1
+    for row in rows:
+        sent = str(row.get("sentiment", "Neutral")).capitalize()
+        if sent not in counts:
+            sent = "Neutral"
+        counts[sent] += 1
 
-    # Define colors (Positive=green, Neutral=blue, Negative=red)
-    colors = ["green", "blue", "red"]
-    labels = [f"{k} ({v})" for k, v in counts.items()]
+    labels = [f"{k} ({v})" for k, v in counts.items() if v > 0]
+    values = [v for v in counts.values() if v > 0]
+    colors_map = {"Positive": "green", "Neutral": "blue", "Negative": "red"}
+    colors = [colors_map[k] for k in counts if counts[k] > 0]
 
-    # Create pie chart
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.pie(
-        counts.values(),
+        values,
         labels=labels,
         autopct="%1.0f%%",
         startangle=140,
         colors=colors,
-        explode=(0.05, 0.05, 0.05),
+        explode=[0.05] * len(values),
         shadow=True,
         wedgeprops={'edgecolor': 'black'}
     )
-    ax.axis("equal")  # keep circle
-
-    # Save to buffer
+    ax.axis("equal")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
 
+
 def build_scandal_timeline(company: str, rows):
-    """Use negative articles as 'scandals' and build a simple timeline."""
-    negatives = [r for r in rows if r["sentiment"] == "Negative"]
-    if not negatives:
-        return f"No notable negative events found for **{company}** in recent articles."
+    """
+    Only include **HARD** items (true scandals: fraud, fines, lawsuits, settlements, etc.)
+    Excludes MEDIUM (probes/scrutiny) and SOFT (revamps/layoffs) from the scandal list.
+    """
+    scandal_rows = [r for r in rows if r.get("level") == "HARD" and r.get("sentiment") == "Negative"]
+
+    if not scandal_rows:
+        return f"No notable enforcement/litigation red flags found for **{company}** in recent articles."
+
+    scandal_rows.sort(
+        key=lambda x: parse_to_utc(x.get("date_raw")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True
+    )
+
     lines = []
-    for r in sorted(negatives, key=lambda x: x["date"] or "", reverse=True):
-        lines.append(f"- **{r['date']}** — [{r['title']}]({r['url']}) · _{r['source']}_")
+    for row in scandal_rows:
+        d = row.get("date") or ""
+        lines.append(f"- **{d}** — [{row.get('title', '')}]({row.get('url', '')}) · _{row.get('source', '')}_")
     return "\n".join(lines)
 
 
-def compute_risk(company: str, summary_md: str, rows):
-    """Lightweight heuristic for a 0–100 risk score."""
-    neg = sum(1 for r in rows if r["sentiment"] == "Negative")
-    total = max(len(rows), 1)
+# =========================
+# Risk scoring (tiered)
+# =========================
+
+def compute_risk(summary_md: str, rows: list[dict]) -> str:
+    """
+    Tiered risk:
+      - HARD events weigh heavily.
+      - MEDIUM (probes/scrutiny) weigh moderately.
+      - SOFT negatives mostly affect sentiment, not risk.
+      - Recent (≤ 90 days) items boost their respective weights.
+      - Dedup prevents echo-chamber spikes.
+    """
+    now = datetime.now(timezone.utc)
+    unique_rows = deduplicate_articles(rows)
+    total = max(len(unique_rows), 1)
+
+    neg = 0
+    hard_hits = 0
+    med_hits = 0
+    recent_hard = 0
+    recent_med = 0
+
+    for r in unique_rows:
+        sent = r.get("sentiment", "Neutral")
+        level = r.get("level", "SOFT")
+        if sent == "Negative":
+            neg += 1
+        dt = parse_to_utc(r.get("date_raw")) or parse_to_utc(r.get("date"))
+
+        if level == "HARD":
+            hard_hits += 1
+            if dt and (now - dt).days <= 90:
+                recent_hard += 1
+        elif level == "MEDIUM":
+            med_hits += 1
+            if dt and (now - dt).days <= 90:
+                recent_med += 1
+
     neg_ratio = neg / total
 
-    summary_lower = (summary_md or "").lower()
-    red_keywords = [
-        "aml", "money laundering", "sanction", "fraud", "bribe",
-        "regulator", "fine", "penalty", "scandal", "lawsuit", "investigation",
-        "whistleblower", "corruption", "sanctions", "non-compliance"
-    ]
-    kw_hits = sum(k in summary_lower for k in red_keywords)
+    text = (summary_md or "").lower()
+    sum_hard = sum(k in text for k in HARD_KEYWORDS)
+    sum_med = sum(k in text for k in MEDIUM_KEYWORDS)
+    sum_hard = min(sum_hard, 3)
+    sum_med = min(sum_med, 3)
 
-    # weights
-    score = round(60 * neg_ratio + 8 * min(kw_hits, 4))
-    score = max(0, min(100, score))
+    # Weighted score
+    score = (
+            30 * neg_ratio +  # general negative
+            30 * min(hard_hits, 4) +  # hard red flags
+            15 * min(recent_hard, 3) +  # very recent hard
+            10 * min(med_hits, 4) +  # medium red flags
+            5 * min(recent_med, 3) +  # recent medium
+            5 * (sum_hard + 0.5 * sum_med)
+    )
+    score = max(0, min(100, round(score)))
 
     if score < 40:
         label = "🟢 Low Risk"
@@ -203,18 +439,21 @@ def compute_risk(company: str, summary_md: str, rows):
     return f"**Risk Score:** **{score}/100** → {label}"
 
 
-def extract_tags(summary_md: str):
+# =========================
+# Tags
+# =========================
+
+def extract_tags(summary: str):
     tags = []
     tag_map = {
-        "#AML": ["aml", "anti-money laundering", "money laundering"],
-        "#Fraud": ["fraud", "scam", "embezzlement"],
+        "#AML": ["aml", "anti-money laundering", "money laundering", "sanction", "sanctions"],
+        "#Fraud": ["fraud", "scam", "embezzlement", "bribery", "corruption"],
         "#ESG": ["esg", "environment", "sustain", "governance", "social"],
         "#Reputation": ["reputation", "public image", "backlash"],
-        "#Compliance": ["regulator", "compliance", "fine", "penalty"],
-        "#Sanctions": ["sanction"],
-        "#Litigation": ["lawsuit", "litigation", "class action"],
+        "#Compliance": ["regulator", "compliance", "fine", "penalty", "settlement"],
+        "#Litigation": ["lawsuit", "litigation", "class action", "investigation", "probe"],
     }
-    text = (summary_md or "").lower()
+    text = (summary or "").lower()
     for tag, kws in tag_map.items():
         if any(k in text for k in kws):
             tags.append(tag)
@@ -223,9 +462,13 @@ def extract_tags(summary_md: str):
     return " ".join(f"`{t}`" for t in tags)
 
 
-def export_markdown(company: str, summary: str, rows, timeline_md: str, risk_md: str, tags_md: str):
-    today = datetime.date.today().isoformat()
-    md = [
+# =========================
+# Export
+# =========================
+
+def export_markdown(company: str, summary: str, rows, timeline: str, risk: str, tags: str):
+    today = date.today().isoformat()
+    summary_lines = [
         f"# Company Risk Report: {company}",
         f"_Generated: {today}_",
         "",
@@ -233,36 +476,40 @@ def export_markdown(company: str, summary: str, rows, timeline_md: str, risk_md:
         summary or "*No summary available.*",
         "",
         "## 📊 Sentiment Snapshot",
-        f"- Positive: {sum(1 for r in rows if r['sentiment']=='Positive')}",
-        f"- Neutral: {sum(1 for r in rows if r['sentiment']=='Neutral')}",
-        f"- Negative: {sum(1 for r in rows if r['sentiment']=='Negative')}",
+        f"- Positive: {sum(1 for row in rows if row['sentiment'] == 'Positive')}",
+        f"- Neutral: {sum(1 for row in rows if row['sentiment'] == 'Neutral')}",
+        f"- Negative: {sum(1 for row in rows if row['sentiment'] == 'Negative')}",
         "",
         "### Recent Articles",
-        ]
+    ]
     if rows:
-        for r in rows:
-            md.append(f"- **{r['date']}** · _{r['source']}_ — [{r['title']}]({r['url']}) · **{r['sentiment']}**")
+        for row in rows:
+            summary_lines.append(
+                f"- **{row.get('date', '')}** · _{row.get('source', '')}_ — "
+                f"[{row.get('title', '')}]({row.get('url', '')}) · **{row.get('sentiment', '')}**"
+            )
     else:
-        md.append("_No recent articles._")
+        summary_lines.append("_No recent articles._")
 
-    md += [
+    summary_lines += [
         "",
         "## 📰 Scandal Timeline",
-        timeline_md or "_No items._",
+        timeline or "_No items._",
         "",
         "## ⚠️ Risk Assessment",
-        risk_md or "_N/A_",
+        risk or "_N/A_",
         "",
         "## 🏷️ Tags",
-        tags_md or "_N/A_",
+        tags or "_N/A_",
         "",
-        ]
+    ]
 
-    content = "\n".join(md)
+    content = "\n".join(summary_lines)
     path = os.path.join(tempfile.gettempdir(), f"{company}_risk_report.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return path
+
 
 # =========================
 # Gradio UI
@@ -294,27 +541,27 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         box-shadow: 0 6px 15px rgba(0,0,0,0.3);
     }
 """) as app:
-
-    # Header
     gr.Markdown(
         "# 🏢 Company Risk Analyzer\nAnalyze potential **red flags** for business partnerships.",
         elem_id="header"
     )
 
-    # Input + Start
     with gr.Row(elem_id="company-section"):
         company_name = gr.Textbox(label="🔍 Company Name", placeholder="e.g., HSBC, Tesla, Binance...", lines=1)
     start_button = gr.Button("🚀 Start Analysis", variant="primary")
 
-    # Tabs
     with gr.Tabs():
         with gr.Tab("📑 Summary"):
-            summary_hdr = gr.Markdown("📑 Summary of Findings", elem_classes="summary-header")
+            gr.Markdown("📑 Summary of Findings", elem_classes="summary-header")
             summary_md = gr.Markdown("", elem_id="result-box")
 
         with gr.Tab("📊 Sentiment"):
             sentiment_img = gr.Image(type="filepath", label="Sentiment Distribution (Recent News)")
-            headlines_tbl = gr.Dataframe(headers=["date", "source", "title", "sentiment", "url"], interactive=False)
+            headlines_tbl = gr.Dataframe(
+                headers=["date", "source", "title", "sentiment", "url"],
+                interactive=False,
+                wrap=True
+            )
 
         with gr.Tab("📰 Scandals"):
             timeline_md = gr.Markdown("", elem_id="result-box")
@@ -327,39 +574,43 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
             export_btn = gr.Button("Generate Markdown Report")
             export_file = gr.File(label="Download Report (.md)")
 
-    # -------- logic
-    def analyze(company: str):
-        # Fetch news
-        rows, err = fetch_news_combined(company)
 
-        # LLM summary
+    # =========================
+    # Orchestration
+    # =========================
+
+    def analyze(company: str):
+        # 1) Fetch (relevance-filtered + deduped + adjusted sentiments + tiered levels)
+        rows, error = fetch_news(company)
+
+        # 2) Summary
         summary = ask_agent(company, rows)
 
-        if err:
+        # 3) Visualization + timeline
+        if error:
             pie_path = None
-            timeline = f"_News error_: {err}"
+            timeline = f"_News error_: {error}"
         else:
-            # Save pie chart safely in system temp dir
             buf = make_sentiment_pie(rows)
             tmp_dir = tempfile.gettempdir()
             pie_path = os.path.join(tmp_dir, f"{company.replace(' ', '_')}_sentiment.png")
             with open(pie_path, "wb") as f:
                 f.write(buf.read())
-
-            # Build scandal timeline from negative news
             timeline = build_scandal_timeline(company, rows)
 
-        # 3) Risk + tags
-        risk = compute_risk(company, summary, rows)
+        # 4) Risk + tags
+        risk = compute_risk(summary, rows)
         tags = extract_tags(summary)
 
-        # dataframe rows (ordered columns)
+        # 5) Table rows
         table = [
-            [r["date"], r["source"], r["title"], r["sentiment"], r["url"]]
-            for r in rows
+            [row.get("date", ""), row.get("source", ""), row.get("title", ""), row.get("sentiment", ""),
+             row.get("url", "")]
+            for row in rows
         ]
 
         return summary, pie_path, table, timeline, risk, tags
+
 
     start_button.click(
         fn=analyze,
@@ -367,6 +618,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         outputs=[summary_md, sentiment_img, headlines_tbl, timeline_md, risk_md, tags_md],
         show_progress="full"
     )
+
 
     def do_export(company: str, summary: str, table, timeline: str, risk: str, tags: str):
         rows = []
@@ -376,6 +628,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         path = export_markdown(company, summary, rows, timeline, risk, tags)
         return path
 
+
     export_btn.click(
         fn=do_export,
         inputs=[company_name, summary_md, headlines_tbl, timeline_md, risk_md, tags_md],
@@ -383,8 +636,10 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         show_progress=True
     )
 
+
 def main():
     app.launch()
+
 
 if __name__ == "__main__":
     main()
