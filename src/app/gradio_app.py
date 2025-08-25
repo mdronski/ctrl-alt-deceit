@@ -1,20 +1,13 @@
-import hashlib
-import io
 import os
 import re
+import json
+import datetime
 import tempfile
-from datetime import datetime, timezone, date
-from difflib import SequenceMatcher
 from urllib.parse import urlparse
-from transformers import pipeline
+
 import gradio as gr
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
-
-from app.agent import agent
-from app.api.finnhub import finnhub_tool
-from app.api.gnewsapi import gnews_tool
-from app.api.newsorgapi import newsapi_tool
 
 load_dotenv()
 classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
@@ -49,475 +42,257 @@ SOFT_NEGATIVE_TERMS = {
 }
 
 
+from app.agent import ask_agent
+
 # =========================
-# Parsing / Normalization helpers
+# Helpers
 # =========================
 
-def parse_to_utc(date_time_raw: str | None) -> datetime | None:
-    """
-        Parse to timezone-aware UTC datetime.
-    """
-    if not date_time_raw:
-        return None
+def _domain(u: str) -> str:
     try:
-        iso = str(date_time_raw).replace("Z", "+00:00")
-        d = datetime.fromisoformat(iso)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d.astimezone(timezone.utc)
+        return urlparse(u).netloc.replace("www.", "")
     except Exception:
-        pass
-    try:
-        val = float(str(date_time_raw).strip())
-        return datetime.fromtimestamp(val, tz=timezone.utc)
-    except Exception:
-        pass
-    # yyyy-mm-dd
-    try:
-        d = datetime.strptime(str(date_time_raw)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return d
-    except Exception:
-        return None
+        return u or ""
 
+def decision_banner(data: dict) -> str:
+    """Show decision only (no justification)."""
+    fa = (data or {}).get("final_assessment") or {}
+    decision = fa.get("decision", "Insufficient Data")
+    emoji = {"Go": "🟢", "Conditional Go": "🟡", "No Go": "🔴", "Insufficient Data": "⚪️"}.get(decision, "⚪️")
+    return f"### {emoji} Decision: **{decision}**"
 
-def normalize_title(title: str) -> str:
-    """Lowercase, strip punctuation, collapse spaces."""
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", (title or "").lower())).strip()
-
-
-def title_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, normalize_title(a), normalize_title(b)).ratio()
-
-
-def url_key(url: str | None) -> str:
-    """Normalize URL to host + path (without query/fragment) for dedup."""
-    if not url:
-        return ""
-    try:
-        u = urlparse(url)
-        return f"{u.netloc.lower()}:{u.path}"
-    except Exception:
-        return url or ""
-
-
-def deduplicate_articles(articles: list[dict], similarity_threshold: float = 0.92) -> list[dict]:
+def build_risks_overview_md(data: dict) -> str:
     """
-    Dedup by:
-      1) exact normalized title hash
-      2) same URL host+path
-      3) fuzzy title similarity across already-kept items
-    Keeps the first occurrence.
+    Count & list risks/weaknesses only.
+    (No Legal/Regulatory or Controversies here to avoid duplication.)
     """
-    unique: list[dict] = []
-    seen_hashes = set()
-    seen_urls = set()
+    risks = (data or {}).get("risks") or []
+    weaknesses = (data or {}).get("weaknesses") or []
 
-    for art in articles:
-        t = art.get("title", "")
-        nk = normalize_title(t)
-        h = hashlib.md5(nk.encode()).hexdigest()
-        ukey = url_key(art.get("url"))
+    lines = [
+        "### Risks Overview",
+        f"- **Explicit risks:** {len(risks)}",
+        f"- **Weaknesses:** {len(weaknesses)}",
+        "",
+    ]
 
-        if h in seen_hashes or (ukey and ukey in seen_urls):
-            continue
+    if risks:
+        lines.append("#### Risks (model-extracted)")
+        for r in risks:
+            lines.append(f"- {str(r).strip()}")
 
-        is_dup = False
-        for u in unique:
-            if ukey and url_key(u.get("url")) == ukey:
-                is_dup = True
-                break
-            if title_similarity(t, u.get("title", "")) >= similarity_threshold:
-                is_dup = True
-                break
+    if weaknesses:
+        lines.append("")
+        lines.append("#### Weaknesses")
+        for w in weaknesses:
+            lines.append(f"- {str(w).strip()}")
 
-        if not is_dup:
-            seen_hashes.add(h)
-            if ukey:
-                seen_urls.add(ukey)
-            unique.append(art)
+    return "\n".join(lines) if lines else "### Risks Overview\n_Not available._"
 
-    return unique
-
-
-def finbert_sentiment(text: str) -> str:
-    if not text:
-        return "Neutral"
-    result = classifier(text[:512])[0]["label"].lower()
-    return {"positive": "Positive", "negative": "Negative", "neutral": "Neutral"}.get(result, "Neutral")
-
-
-def adjust_sentiment(title: str, sentiment: str) -> str:
+def _extract_first_json(text: str):
     """
-    Downgrades "Negative" to "Neutral" for soft business terms (revamp/layoffs/etc).
-    Leaves true negatives as-is.
+    Extract the FIRST JSON object at the start of the model output.
+    Supports both plain and ```json fenced blocks.
+    Returns (obj, remaining_markdown) or (None, text) if not found/parsable.
     """
-    t = (title or "").lower()
-    if sentiment == "Negative" and any(term in t for term in SOFT_NEGATIVE_TERMS):
-        return "Neutral"
-    return sentiment
+    s = (text or "").lstrip()
+    if not s:
+        return None, text
 
 
-def classify_article_level(title: str, body: str = "") -> str:
-    """
-    HARD: contains any HARD_KEYWORDS
-    MEDIUM: contains any MEDIUM_KEYWORDS (and no HARD)
-    SOFT: otherwise
-    """
-    t = f"{title or ''} {body or ''}".lower()
-    if any(k in t for k in HARD_KEYWORDS):
-        return "HARD"
-    if any(k in t for k in MEDIUM_KEYWORDS):
-        return "MEDIUM"
-    return "SOFT"
-
-
-def is_relevant(company: str, title: str, url: str, source: str) -> bool:
-    """
-    Keep only articles clearly about the target company to prevent pollution
-    (e.g., random 'GST buzz' pieces).
-    Rules:
-      - title contains the full company phrase, OR
-      - title contains any strong token from company name (>=3 chars), OR
-      - url host or path contains a strong token (handles tickers/brands in URLs)
-    """
-    if not company:
-        return True
-
-    full = company.strip().lower()
-    title_l = (title or "").lower()
-    if full and full in title_l:
-        return True
-
-    tokens = [tok for tok in re.split(r"[^a-z0-9]+", full) if len(tok) >= 3]
-    if tokens and any(tok in title_l for tok in tokens):
-        return True
-
-    try:
-        u = urlparse(url or "")
-        host_path = (u.netloc + u.path).lower()
-        if tokens and any(tok in host_path for tok in tokens):
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-# =========================
-# LLM summary
-# =========================
-
-def ask_agent(company_name: str, rows: list[dict]) -> str:
-    if not rows:
-        return f"No articles found to analyze for {company_name}."
-
-    news_text = "\n".join(
-        f"- {row.get('date', '')} · {row.get('source', '')} — {row.get('title', '')} ({row.get('sentiment', '')})\n  {row.get('url', '')}"
-        for row in rows
-    )
-
-    prompt = f"""
-    You are a due diligence analyst. Analyze recent news about '{company_name}'.
-    Identify **red flags** (fraud, AML/sanctions evasion, fines/penalties, settlements, lawsuits/litigation, indictments/arrests, bankruptcy/insolvency).
-    Treat **regulatory scrutiny/probes/inquiries** as **medium risk**, not scandals, unless tied to enforcement or fraud.
-    Treat **restructuring/layoffs/revamps/client offboarding** as **operational** unless combined with the above.
-    
-    Articles:
-    {news_text}
-
-    Do a web search to verify the articles and look for other potential risks about the company.
-    Return a concise **markdown summary** grouped by issue type.
-    """
-    response = agent.invoke({"messages": [{"role": "user", "content": prompt.strip()}]})
-    return response["messages"][-1].content
-
-
-# =========================
-# Fetch + normalize
-# =========================
-
-def fetch_news(company: str):
-    """
-    Retrieves news from NewsAPI, GNews, and Finnhub.
-    Returns a unified list of dicts and an optional error message.
-    Applies relevance filtering and aggressive de-duplication.
-    """
-    tools = [newsapi_tool, gnews_tool, finnhub_tool]
-    articles_all: list[dict] = []
-    errors = []
-
-    for tool_fn in tools:
+    m = re.match(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
+    if m:
+        js = m.group(1); rest = s[m.end():].strip()
         try:
-            result = tool_fn(company)
-            if "No articles found" in result:
-                continue
+            return json.loads(js), rest
+        except Exception:
+            return None, text
 
-            articles = result.split("-" * 40)
-            for article in articles:
-                if not article.strip():
-                    continue
-                lines = [ln for ln in article.strip().split("\n") if ln.strip()]
-                record = {}
-                for line in lines:
-                    if line.startswith("Title:"):
-                        record["title"] = line.replace("Title:", "").strip()
-                    elif line.startswith("Source:"):
-                        record["source"] = line.replace("Source:", "").strip()
-                    elif line.startswith("Date:"):
-                        record["date_raw"] = line.replace("Date:", "").strip()
-                        dt = parse_to_utc(record["date_raw"])
-                        record["date"] = dt.date().isoformat() if dt else ""
-                    elif line.startswith("URL:"):
-                        record["url"] = line.replace("URL:", "").strip()
-                    elif line.startswith("Content:"):
-                        record["content"] = line.replace("Content:", "").strip()
+    start = s.find("{")
+    if start == -1:
+        return None, text
 
-                if not record:
-                    continue
+    depth = 0; in_str = False; esc = False; end_idx = None
+    for i, ch in enumerate(s[start:], start=start):
+        if in_str:
+            if esc: esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"': in_str = False
+        else:
+            if ch == '"': in_str = True
+            elif ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end_idx = i + 1
+                    break
+    if end_idx:
+        js = s[start:end_idx]; rest = s[end_idx:].strip()
+        try:
+            return json.loads(js), rest
+        except Exception:
+            return None, text
+    return None, text
 
-                # Relevance gate
-                if not is_relevant(company, record.get("title", ""), record.get("url", ""), record.get("source", "")):
-                    continue
+def extract_sources_from_markdown(summary_md: str, max_items: int = 30) -> list[str]:
+    """Collect URLs from Markdown, dedupe, return list."""
+    text = summary_md or ""
+    urls = []
+    urls += re.findall(r"\[[^\]]*\]\((https?://[^)]+)\)", text)
+    urls += re.findall(r"(https?://[^\s)]+)", text)
 
-                # Sentiment
-                base_sent = finbert_sentiment(record.get("title", ""))
+    seen, uniq = set(), []
+    for u in urls:
+        u = u.strip()
+        if u and u not in seen:
+            seen.add(u); uniq.append(u)
+        if len(uniq) >= max_items:
+            break
+    return uniq
 
-                record["sentiment"] = adjust_sentiment(record.get("title", ""), base_sent)
+def md_sources_list(urls: list[str]) -> str:
+    if not urls:
+        return "_No sources detected._"
+    return "\n".join(f"- [{_domain(u)}]({u})" for u in urls)
 
-                level = classify_article_level(record.get("title", ""))
+def block_md_list(title: str, lines: list[str]) -> str:
+    body = "\n".join(f"- {line}" for line in (lines or [])) if lines else "_Not available._"
+    return f"### {title}\n{body}"
 
-                articles_all.append({
-                    "title": record.get("title", ""),
-                    "source": record.get("source", ""),
-                    "content": record.get("content", ""),
-                    "date": record.get("date", ""),
-                    "date_raw": record.get("date_raw", ""),
-                    "url": record.get("url", ""),
-                    "sentiment": record.get("sentiment", "Neutral"),
-                    "level": level,
-                })
+def build_profile_md(profile: dict) -> str:
+    if not isinstance(profile, dict):
+        return block_md_list("Company Profile", [])
+    lines = [
+        f"**Industry:** {profile.get('industry','') or 'Not available'}",
+        f"**Size:** {profile.get('size','') or 'Not available'}",
+        f"**HQ Location:** {profile.get('hq_location','') or 'Not available'}",
+        f"**Founded:** {profile.get('founded_year','') or 'Not available'}",
+        f"**Description:** {profile.get('description','') or 'Not available'}",
+    ]
+    return block_md_list("Company Profile", lines)
 
-        except Exception as e:
-            errors.append(f"{tool_fn.name} failed: {str(e)}")
+def build_financials_md(fin: dict) -> str:
+    if not isinstance(fin, dict):
+        return block_md_list("Financials", [])
+    lines = [
+        f"**Revenue:** {fin.get('revenue','') or 'Not available'}",
+        f"**Profitability:** {fin.get('profitability','') or 'Not available'}",
+        f"**Growth:** {fin.get('growth','') or 'Not available'}",
+        f"**Notes:** {fin.get('notes','') or 'Not available'}",
+    ]
+    return block_md_list("Financials", lines)
 
-    print(f"Total articles fetched: {len(articles_all)}")
-
-    if not articles_all:
-        return [], "No articles found from any source." + (f" Errors: {errors}" if errors else "")
-
-    # Deduplicate articles
-    articles_all = deduplicate_articles(articles_all)
-
-    print(f"Articles after deduplication: {len(articles_all)}")
-
-    return articles_all, None
-
-
-# =========================
-# Visualization + timeline
-# =========================
-def make_sentiment_pie(rows):
-    counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
-    for row in rows:
-        sent = str(row.get("sentiment", "Neutral")).capitalize()
-        if sent not in counts:
-            sent = "Neutral"
-        counts[sent] += 1
-
-    labels = [f"{k} ({v})" for k, v in counts.items() if v > 0]
-    values = [v for v in counts.values() if v > 0]
-    colors_map = {
-        "Positive": "#4CAF50",
-        "Neutral": "#9E9E9E",
-        "Negative": "#F44336",
-    }
-    colors = [colors_map[k] for k in counts if counts[k] > 0]
-
-    fig, ax = plt.subplots(figsize=(3, 3), facecolor="white")
-    wedges, texts, autotexts = ax.pie(
-        values,
-        labels=labels,
-        autopct="%1.0f%%",
-        startangle=140,
-        colors=colors,
-        wedgeprops={"edgecolor": "white", "linewidth": 2},
-        textprops={"fontsize": 10, "color": "black"},
-    )
-
-    for autotext in autotexts:
-        autotext.set_fontsize(12)
-        autotext.set_color("white")
-        autotext.set_weight("bold")
-
-    ax.axis("equal")
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def build_scandal_timeline(company: str, rows):
-    """
-    Only include **HARD** items (true scandals: fraud, fines, lawsuits, settlements, etc.)
-    Excludes MEDIUM (probes/scrutiny) and SOFT (revamps/layoffs) from the scandal list.
-    """
-    scandal_rows = [r for r in rows if r.get("level") == "HARD" and r.get("sentiment") == "Negative"]
-
-    if not scandal_rows:
-        return f"No notable enforcement/litigation red flags found for **{company}** in recent articles."
-
-    scandal_rows.sort(
-        key=lambda x: parse_to_utc(x.get("date_raw")) or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True
-    )
-
+def build_leadership_md(arr: list[dict]) -> str:
     lines = []
-    for row in scandal_rows:
-        d = row.get("date") or ""
-        lines.append(f"- **{d}** — [{row.get('title', '')}]({row.get('url', '')}) · _{row.get('source', '')}_")
-    return "\n".join(lines)
+    for x in arr or []:
+        name = str(x.get("name","")).strip()
+        role = str(x.get("role","")).strip()
+        notes = str(x.get("notes","")).strip()
+        lines.append(f"**{name}** — {role}" + (f" — {notes}" if notes else ""))
+    return block_md_list("Leadership & Ownership", lines)
 
+def build_legal_md(arr: list[dict]) -> str:
+    lines = []
+    for x in arr or []:
+        date = str(x.get("date","")).strip()
+        issue = str(x.get("issue","")).strip()
+        status = str(x.get("status","")).strip()
+        src = str(x.get("source","")).strip()
+        link = f" — [{_domain(src)}]({src})" if src else ""
+        lines.append(f"**{date}** — {issue} — _{status}_{link}")
+    return block_md_list("Legal & Regulatory", lines)
 
-# =========================
-# Risk scoring (tiered)
-# =========================
+def build_partnerships_md(arr: list[dict]) -> str:
+    lines = []
+    for x in arr or []:
+        nm = str(x.get("name","")).strip()
+        typ = str(x.get("type","")).strip()
+        notes = str(x.get("notes","")).strip()
+        lines.append(f"**{nm}**" + (f" ({typ})" if typ else "") + (f" — {notes}" if notes else ""))
+    return block_md_list("Partnerships & Clients", lines)
 
-def compute_risk(summary_md: str, rows: list[dict]) -> str:
+def build_controversies_md(contro_arr: list[dict], legal_arr: list[dict], rows: list[dict], leadership: list[dict]) -> str:
     """
-    Tiered risk:
-      - HARD events weigh heavily.
-      - MEDIUM (probes/scrutiny) weigh moderately.
-      - SOFT negatives mostly affect sentiment, not risk.
-      - Recent (≤ 90 days) items boost their respective weights.
-      - Dedup prevents echo-chamber spikes.
+    Prefer JSON 'controversies'; else derive from legal items; else from negative news.
+    No text trimming.
     """
-    now = datetime.now(timezone.utc)
-    unique_rows = deduplicate_articles(rows)
-    total = max(len(unique_rows), 1)
+    lines = []
 
-    neg = 0
-    hard_hits = 0
-    med_hits = 0
-    recent_hard = 0
-    recent_med = 0
-
-    for r in unique_rows:
-        sent = r.get("sentiment", "Neutral")
-        level = r.get("level", "SOFT")
-        if sent == "Negative":
-            neg += 1
-        dt = parse_to_utc(r.get("date_raw")) or parse_to_utc(r.get("date"))
-
-        if level == "HARD":
-            hard_hits += 1
-            if dt and (now - dt).days <= 90:
-                recent_hard += 1
-        elif level == "MEDIUM":
-            med_hits += 1
-            if dt and (now - dt).days <= 90:
-                recent_med += 1
-
-    neg_ratio = neg / total
-
-    text = (summary_md or "").lower()
-    sum_hard = sum(k in text for k in HARD_KEYWORDS)
-    sum_med = sum(k in text for k in MEDIUM_KEYWORDS)
-    sum_hard = min(sum_hard, 3)
-    sum_med = min(sum_med, 3)
-
-    # Weighted score
-    score = (
-            30 * neg_ratio +  # general negative
-            30 * min(hard_hits, 4) +  # hard red flags
-            15 * min(recent_hard, 3) +  # very recent hard
-            10 * min(med_hits, 4) +  # medium red flags
-            5 * min(recent_med, 3) +  # recent medium
-            5 * (sum_hard + 0.5 * sum_med)
-    )
-    score = max(0, min(100, round(score)))
-
-    if score < 40:
-        label = "🟢 Low Risk"
-    elif score < 70:
-        label = "🟡 Medium Risk"
-    else:
-        label = "🔴 High Risk"
-
-    return f"**Risk Score:** **{score}/100** → {label}"
-
-
-# =========================
-# Tags
-# =========================
-
-def extract_tags(summary: str):
-    tags = []
-    tag_map = {
-        "#AML": ["aml", "anti-money laundering", "money laundering", "sanction", "sanctions"],
-        "#Fraud": ["fraud", "scam", "embezzlement", "bribery", "corruption"],
-        "#ESG": ["esg", "environment", "sustain", "governance", "social"],
-        "#Reputation": ["reputation", "public image", "backlash"],
-        "#Compliance": ["regulator", "compliance", "fine", "penalty", "settlement"],
-        "#Litigation": ["lawsuit", "litigation", "class action", "investigation", "probe"],
-    }
-    text = (summary or "").lower()
-    for tag, kws in tag_map.items():
-        if any(k in text for k in kws):
-            tags.append(tag)
-    if not tags:
-        tags = ["#GeneralRisk"]
-    return " ".join(f"`{t}`" for t in tags)
-
-
-# =========================
-# Export
-# =========================
-
-def export_markdown(company: str, summary: str, rows, timeline: str, risk: str, tags: str):
-    today = date.today().isoformat()
-    summary_lines = [
-        f"# Company Risk Report: {company}",
-        f"_Generated: {today}_",
-        "",
-        "## 📑 Summary",
-        summary or "*No summary available.*",
-        "",
-        "## 📊 Sentiment Snapshot",
-        f"- Positive: {sum(1 for row in rows if row['sentiment'] == 'Positive')}",
-        f"- Neutral: {sum(1 for row in rows if row['sentiment'] == 'Neutral')}",
-        f"- Negative: {sum(1 for row in rows if row['sentiment'] == 'Negative')}",
-        "",
-        "### Recent Articles",
-    ]
-    if rows:
-        for row in rows:
-            summary_lines.append(
-                f"- **{row.get('date', '')}** · _{row.get('source', '')}_ — "
-                f"[{row.get('title', '')}]({row.get('url', '')}) · **{row.get('sentiment', '')}**"
+    # 1) JSON controversies
+    if contro_arr:
+        for c in contro_arr:
+            date = str(c.get("date","")).strip()
+            entity = str(c.get("entity","")).strip()
+            etype = str(c.get("entity_type","")).strip()
+            title = str(c.get("title","")).strip()
+            summ = str(c.get("summary","")).strip()
+            src = str(c.get("source","")).strip()
+            link = f" — [{_domain(src)}]({src})" if src else ""
+            tail = f" — _{etype}_" if etype else ""
+            lines.append(
+                f"**{date}** — **{entity}**{tail} — {title}"
+                + (f" — {summ}" if summ else "")
+                + link
             )
-    else:
-        summary_lines.append("_No recent articles._")
 
-    summary_lines += [
-        "",
-        "## 📰 Scandal Timeline",
-        timeline or "_No items._",
-        "",
-        "## ⚠️ Risk Assessment",
-        risk or "_N/A_",
-        "",
-        "## 🏷️ Tags",
-        tags or "_N/A_",
-        "",
-    ]
+    # 2) Fallback: legal/regulatory
+    if not lines and legal_arr:
+        for x in legal_arr:
+            date = str(x.get("date","")).strip()
+            issue = str(x.get("issue","")).strip()
+            status = str(x.get("status","")).strip()
+            src = str(x.get("source","")).strip()
+            link = f" — [{_domain(src)}]({src})" if src else ""
+            lines.append(f"**{date}** — **Company** — {issue} — _{status}_{link}")
 
-    content = "\n".join(summary_lines)
-    path = os.path.join(tempfile.gettempdir(), f"{company}_risk_report.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return path
+    # 3) Fallback: negative headlines
+    if not lines and rows:
+        leader_names = [str(l.get("name","")).strip() for l in (leadership or []) if isinstance(l, dict)]
+        for r in rows:
+            if (str(r.get("sentiment","")).strip().lower()) == "negative":
+                title = str(r.get("title","")).strip()
+                entity = "Company"
+                etype = "Company"
+                t_low = title.lower()
+                for name in leader_names:
+                    if name and name.lower() in t_low:
+                        entity = name; etype = "Leader"; break
+                src = str(r.get("url","")).strip()
+                link = f" — [{_domain(src)}]({src})" if src else ""
+                lines.append(f"**{str(r.get('date','')).strip()}** — **{entity}** — {title}{link}")
+
+    return block_md_list("Controversies", lines)
+
+def build_news_md(json_news: list[dict], rows: list[dict]) -> str:
+    items = json_news if json_news else rows
+    lines = []
+    for r in items or []:
+        date = str(r.get("date","")).strip()
+        title = str(r.get("title","")).strip()
+        src_name = _domain(str(r.get("url","")).strip()) if r.get("url") else str(r.get("source","")).strip()
+        url = str(r.get("url","")).strip()
+        link = f"[{src_name}]({url})" if url else (src_name or "")
+        lines.append(f"**{date}** — {title}" + (f" — {link}" if link else ""))
+    return block_md_list("Recent Articles", lines)
+
+def sources_from_both(data: dict, markdown_summary: str) -> list[str]:
+    urls = []
+    if isinstance(data, dict):
+        urls += [u for u in (data.get("sources") or []) if isinstance(u, str)]
+    if not urls:
+        text = markdown_summary or ""
+        urls += re.findall(r"\[[^\]]*\]\((https?://[^)]+)\)", text)
+        urls += re.findall(r"(https?://[^\s)]+)", text)
+    # de-dup
+    seen, dedup = set(), []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u); dedup.append(u)
+    return dedup
+
+# Stub: you can wire your real news tools later if you want
+def fetch_news_combined(company: str):
+    return [], None
 
 
 # =========================
@@ -556,28 +331,42 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
     )
 
     with gr.Row(elem_id="company-section"):
-        company_name = gr.Textbox(label="🔍 Company Name", placeholder="e.g., HSBC, Tesla, Binance...", lines=1)
+        company_name = gr.Textbox(label="🔍 Company Name", placeholder="e.g., HSBC, Yamaha, Binance...", lines=1)
     start_button = gr.Button("🚀 Start Analysis", variant="primary")
 
     with gr.Tabs():
         with gr.Tab("📑 Summary"):
-            gr.Markdown("📑 Summary of Findings", elem_classes="summary-header")
+            summary_hdr = gr.Markdown("📑 Summary of Findings", elem_classes="summary-header")
+            decision_md = gr.Markdown("", elem_id="result-box")
             summary_md = gr.Markdown("", elem_id="result-box")
 
-        with gr.Tab("📊 Sentiment"):
-            sentiment_img = gr.Image(type="filepath", label="Sentiment Distribution (Recent News)")
-            headlines_tbl = gr.Dataframe(
-                headers=["date", "source", "title", "sentiment", "url"],
-                interactive=False,
-                wrap=True
-            )
+        with gr.Tab("🏷️ Company Profile"):
+            profile_md = gr.Markdown("", elem_id="result-box")
 
-        with gr.Tab("📰 Scandals"):
-            timeline_md = gr.Markdown("", elem_id="result-box")
+        with gr.Tab("💹 Financials"):
+            financials_md = gr.Markdown("", elem_id="result-box")
 
-        with gr.Tab("⚠️ Risk"):
-            risk_md = gr.Markdown("", elem_id="result-box")
-            tags_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("👤 Leadership & Ownership"):
+            leadership_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("⚖️ Legal & Regulatory"):
+            legal_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("🤝 Partnerships & Clients"):
+            partnerships_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("🚨 Controversies"):
+            controversies_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("🗞️ News"):
+            news_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("🔗 Sources"):
+            sources_md = gr.Markdown("", elem_id="result-box")
+
+        with gr.Tab("⚠️ Risks Overview"):
+            risks_overview_md = gr.Markdown("", elem_id="result-box")
 
         with gr.Tab("📄 Export"):
             export_btn = gr.Button("Generate Markdown Report")
@@ -589,58 +378,144 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
     # =========================
 
     def analyze(company: str):
-        # 1) Fetch (relevance-filtered + deduped + adjusted sentiments + tiered levels)
-        rows, error = fetch_news(company)
+        rows, _ = fetch_news_combined(company)  # usually []
 
-        # 2) Summary
-        summary = ask_agent(company, rows)
+        full_output = ask_agent(company, rows)
+        data, markdown_summary = _extract_first_json(full_output)
+        data = data if isinstance(data, dict) else {}
 
-        # 3) Visualization + timeline
-        if error:
-            pie_path = None
-            timeline = f"_News error_: {error}"
-        else:
-            buf = make_sentiment_pie(rows)
-            tmp_dir = tempfile.gettempdir()
-            pie_path = os.path.join(tmp_dir, f"{company.replace(' ', '_')}_sentiment.png")
-            with open(pie_path, "wb") as f:
-                f.write(buf.read())
-            timeline = build_scandal_timeline(company, rows)
+        # Decision banner (top of Summary)
+        decision_block = decision_banner(data)
 
-        # 4) Risk + tags
-        risk = compute_risk(summary, rows)
-        tags = extract_tags(summary)
+        # Risks Overview (counts + lists; no duplicates with other tabs)
+        risks_overview_block = build_risks_overview_md(data)
 
-        # 5) Table rows
-        table = [
-            [row.get("date", ""), row.get("source", ""), row.get("title", ""), row.get("sentiment", ""),
-             row.get("url", "")]
-            for row in rows
-        ]
+        # Structured sections from JSON
+        profile = data.get("company_profile", {}) or {}
+        fin = data.get("financials", {}) or {}
+        leadership = data.get("leadership_and_ownership", []) or []
+        legal = data.get("legal_and_regulatory", []) or []
+        partners = data.get("partnerships_and_clients", []) or []
+        json_news = data.get("recent_news", []) or []
+        controversies = data.get("controversies", []) or []
 
-        return summary, pie_path, table, timeline, risk, tags
+        # Markdown sections (no truncation)
+        profile_block = build_profile_md(profile)
+        financials_block = build_financials_md(fin)
+        leadership_block = build_leadership_md(leadership)
+        legal_block = build_legal_md(legal)
+        partnerships_block = build_partnerships_md(partners)
+        controversies_block = build_controversies_md(controversies, legal, rows, leadership)
+        news_block = build_news_md(json_news, rows)
+
+        # Sources
+        src_urls = sources_from_both(data, markdown_summary)
+        sources_block = md_sources_list(src_urls)
+
+        # Return in UI order
+        return (
+            markdown_summary,      # summary_md
+            decision_block,        # decision_md
+            profile_block,
+            financials_block,
+            leadership_block,
+            legal_block,
+            partnerships_block,
+            controversies_block,
+            news_block,
+            sources_block,
+            risks_overview_block   # risks_overview_md
+        )
 
 
     start_button.click(
         fn=analyze,
         inputs=[company_name],
-        outputs=[summary_md, sentiment_img, headlines_tbl, timeline_md, risk_md, tags_md],
+        outputs=[
+            summary_md,
+            decision_md,
+            profile_md,
+            financials_md,
+            leadership_md,
+            legal_md,
+            partnerships_md,
+            controversies_md,
+            news_md,
+            sources_md,
+            risks_overview_md
+        ],
         show_progress="full"
     )
 
-
-    def do_export(company: str, summary: str, table, timeline: str, risk: str, tags: str):
-        rows = []
-        if table is not None and not table.empty:
-            for row in table.itertuples(index=False):
-                rows.append({"date": row[0], "source": row[1], "title": row[2], "sentiment": row[3], "url": row[4]})
-        path = export_markdown(company, summary, rows, timeline, risk, tags)
+    def export_markdown(
+        company: str,
+        summary_block: str,
+        decision_block: str,
+        profile_block: str,
+        financials_block: str,
+        leadership_block: str,
+        legal_block: str,
+        partnerships_block: str,
+        controversies_block: str,
+        news_block: str,
+        sources_block: str,
+        risks_overview_block: str,
+    ):
+        today = datetime.date.today().isoformat()
+        md = [
+            f"# Company Risk Report: {company}",
+            f"_Generated: {today}_",
+            "",
+            "## ✅ Decision",
+            decision_block or "_No decision available._",
+            "",
+            "## 📑 Summary",
+            summary_block or "*No summary available.*",
+            "",
+            profile_block or "## 🏷️ Company Profile\n_Not available._",
+            "",
+            financials_block or "## 💹 Financials\n_Not available._",
+            "",
+            leadership_block or "## 👤 Leadership & Ownership\n_Not available._",
+            "",
+            legal_block or "## ⚖️ Legal & Regulatory\n_Not available._",
+            "",
+            partnerships_block or "## 🤝 Partnerships & Clients\n_Not available._",
+            "",
+            controversies_block or "## 🚨 Controversies\n_Not available._",
+            "",
+            news_block or "## 🗞️ News\n_Not available._",
+            "",
+            "## 🔗 Sources",
+            sources_block or "_No sources detected._",
+            "",
+            "## ⚠️ Risks Overview",
+            risks_overview_block or "_Not available._",
+            "",
+        ]
+        content = "\n".join(md)
+        path = os.path.join(tempfile.gettempdir(), f"{company}_risk_report.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
         return path
 
 
     export_btn.click(
-        fn=do_export,
-        inputs=[company_name, summary_md, headlines_tbl, timeline_md, risk_md, tags_md],
+        fn=export_markdown,
+        inputs=[
+            company_name,
+            summary_md,
+            decision_md,
+            profile_md,
+            financials_md,
+            leadership_md,
+            legal_md,
+            partnerships_md,
+            controversies_md,
+            news_md,
+            sources_md,
+            risks_overview_md,
+        ],
         outputs=[export_file],
         show_progress=True
     )
