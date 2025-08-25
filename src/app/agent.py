@@ -15,16 +15,26 @@ for var in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_AUTH_TOKEN", "GOOGLE_CLOUD
 SYSTEM_PROMPT = """You are a due-diligence analyst for HSBC.
 Your role is to evaluate potential business partners.
 Always act conservatively and prioritize risk awareness.
-Use only credible, verifiable information.
-If information is missing or uncertain, explicitly state “Not available”.
-Highlight red flags such as sanctions, lawsuits, financial instability, or reputational issues.
-Never fabricate details.
+Use only credible, verifiable information. Never fabricate details.
+If information is missing or uncertain, explicitly state “Not available” or “Unconfirmed + reason”.
+
+Scope of the review (ALWAYS cover each item):
+1) Company activity: products, markets, clients, licensing, compliance history.
+2) Leadership/owners: backgrounds, other ventures, investments, board seats, conflicts of interest.
+3) Legal/regulatory: investigations, fines, sanctions, lawsuits, settlements.
+4) Reputation & ESG: safety/privacy, labor, environmental, community impact, misinformation/content issues.
+5) Sensitive ties: defense/dual-use, surveillance, spyware, government contracts, lobbying/political spend.
+
+Rules:
+- Separate “Company activity” from “Leader personal activity” and label each clearly.
+- If you suspect a notable controversy exists but cannot verify it now, mark it “Unconfirmed” and add a suggested query in research_gaps.
+- Prefer concise bullet points; avoid speculation or editorializing.
 """
 
-# 🚀 NEW: richer, structured JSON schema + “Sources” discipline
+
 DEVELOPER_PROMPT = """Return output in two parts, in this exact order:
 
-1) A SINGLE JSON object with these fields:
+1) A SINGLE JSON object with these fields (keep them even if empty; extra fields are allowed):
 
 {
   "company_profile": {
@@ -58,32 +68,54 @@ DEVELOPER_PROMPT = """Return output in two parts, in this exact order:
     { "date": "", "title": "", "source": "", "url": "", "sentiment": "" }
   ],
   "controversies": [
-    { "date": "", "title": "", "entity": "", "entity_type": "Company|Leader", "summary": "", "source": "" }
+    {
+      "date": "",
+      "title": "",
+      "entity": "",
+      "entity_type": "Company|Leader",
+      "summary": "",
+      "source": "",
+      "linkage": "Direct|Indirect",
+      "materiality": "Low|Medium|High",
+      "status": "Allegation|Ongoing|Confirmed|Resolved|Unconfirmed"
+    }
   ],
   "strengths": [],
   "weaknesses": [],
   "risks": [],
   "final_assessment": {
-    "decision": "Go",
-    "justification": ""
+    "decision": "Go|Conditional Go|No Go|Insufficient Data",
+    "justification": "",
+    "confidence": "Low|Medium|High",
+    "key_factors": []
   },
-  "sources": []
+  "sources": [],
+  "research_gaps": [
+    { "query": "", "why": "" }
+  ],
+  "aliases": {
+    "people": [],
+    "brands": []
+  },
+  "timeframe": ""
 }
 
-Rules:
-- Keep values concise, human-readable strings. Use arrays where specified.
-- If a value is unknown, use "" or [] (do NOT invent facts).
-- "decision" ∈ {"Go","Conditional Go","No Go","Insufficient Data"} with justification.
-- "entity_type" is either "Company" or "Leader".
-- "sources" is a de-duplicated list of canonical URLs (max 20).
+Required behavior:
+- Keep values concise and factual. If unknown, use "" or [] (do NOT invent).
+- For any legal/controversy item without a verifiable URL, set "status":"Unconfirmed", leave "source":"", and add a related entry in research_gaps with a concrete query to run later.
+- In controversies:
+  - Set "entity_type" to "Leader" for personal ventures (e.g., defense/dual-use investments) and "Company" for corporate actions.
+  - Set "linkage" to "Indirect" when it’s a leader’s personal activity, and "Direct" for company actions.
+  - Provide a reasoned "materiality" (Low/Medium/High) based on potential impact on HSBC counterpart risk.
 
 2) A Markdown summary for a human reader:
-- Use short sections and bullet points.
-- Include inline links/citations near claims when available.
-- End with a top-level "Sources" section listing up to 20 canonical URLs as markdown links.
+- Use short sections and bullets.
+- Explicitly split “Company activity” vs “Leader personal activity”.
+- Include inline links next to claims when available.
+- End with a top-level "Sources" section listing up to 20 canonical URLs as markdown links (deduplicated).
 
 Do not include any prose before the JSON. Do not wrap the JSON in extra text. Ensure valid JSON.
-When there is insufficient information, prefer "Insufficient Data" over "No Go" and state what additional sources would be needed.
+When evidence is insufficient, prefer "Insufficient Data" over "No Go" and add targeted research_gaps with specific queries.
 """
 
 # Single model instance (no tools)
@@ -116,16 +148,23 @@ def _coerce_content_to_text(content) -> str:
 
 def _build_user_prompt(company_name: str, rows: list[dict]) -> str:
     base = f"""
-Gather all publicly available and credible information about the target company "{company_name}" in order to assess whether HSBC should consider them a reliable business partner.
+Gather all publicly available and credible information about the target company "{company_name}" to assess whether HSBC should consider them a reliable business partner.
 
 Include the following categories:
 - Basic facts (industry, size, location, year founded).
 - Financial performance and growth trends.
-- Leadership and ownership details with their controversies. 
+- Leadership and ownership details with any other ventures, investments, and board seats.
 - Reputation (reviews, press, social media sentiment).
 - Legal or regulatory issues (lawsuits, sanctions, investigations).
 - Partnerships and major clients.
 - Recent news and controversies.
+
+Leadership controversy probe (ALWAYS run this sweep):
+- Check for defense/dual-use or military-related ventures or investments (e.g., Helsing, Anduril, Palantir, NSO Group).
+- Check for surveillance/spyware, privacy controversies, or extremist/violent content links.
+- Check for lobbying/political spending, major philanthropic vehicles, and conflicts of interest.
+- Consider alternate spellings and languages (e.g., defence vs defense; diacritics).
+- If you suspect a relevant issue (e.g., a leader investing in a defense AI startup) but cannot verify it now, mark the item as "Unconfirmed" and add a "research_gaps" entry with concrete queries (e.g., "<Leader Name> investment Helsing site:reuters.com OR site:ft.com").
 
 Summarize findings into strengths, weaknesses, risks, and a final assessment for HSBC.
 
@@ -142,6 +181,7 @@ Prepare the output as per the required JSON schema, followed by a Markdown summa
         base += f"\n\nProvided recent articles (may be incomplete):\n{news_text}"
     else:
         base += "\n\nNo recent articles were provided."
+
     return base
 
 def ask_agent(company_name: str, rows: list[dict]) -> str:
