@@ -6,41 +6,9 @@ import tempfile
 from urllib.parse import urlparse
 
 import gradio as gr
-import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 
 load_dotenv()
-classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-
-# =========================
-# Keyword tiers (HARD/ MEDIUM / SOFT)
-# =========================
-
-HARD_KEYWORDS = {
-    # enforcement & criminal / insolvency
-    "fraud", "bribery", "embezzlement", "corruption", "money laundering", "aml",
-    "sanctions evasion", "insider trading",
-    "fine", "fines", "penalty", "penalties", "settlement",
-    "lawsuit", "litigation", "class action",
-    "indictment", "arrest", "criminal charges",
-    "bankruptcy", "insolvency", "collapse", "liquidation", "administration"
-}
-
-MEDIUM_KEYWORDS = {
-    # regulatory & supervisory without proven wrongdoing
-    "regulatory scrutiny", "regulator scrutiny", "scrutiny from regulators",
-    "regulatory probe", "probe", "investigation", "inquiry",
-    "supervisory review", "compliance review", "regulatory review",
-    "watchlist", "warning letter"
-}
-
-SOFT_NEGATIVE_TERMS = {
-    # business hygiene / strategy – should not be scandals by themselves
-    "revamp", "restructuring", "restructure", "layoffs", "job cuts", "headcount",
-    "exit clients", "client exits", "client offboarding", "offboarding",
-    "reorg", "re-organization", "guidance cut", "profit warning", "downgrade"
-}
-
 
 from app.agent import ask_agent
 
@@ -98,7 +66,6 @@ def _extract_first_json(text: str):
     s = (text or "").lstrip()
     if not s:
         return None, text
-
 
     m = re.match(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
     if m:
@@ -294,7 +261,6 @@ def sources_from_both(data: dict, markdown_summary: str) -> list[str]:
 def fetch_news_combined(company: str):
     return [], None
 
-
 # =========================
 # Gradio UI
 # =========================
@@ -325,6 +291,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         box-shadow: 0 6px 15px rgba(0,0,0,0.3);
     }
 """) as app:
+
     gr.Markdown(
         "# 🏢 Company Risk Analyzer\nAnalyze potential **red flags** for business partnerships.",
         elem_id="header"
@@ -345,7 +312,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
 
         with gr.Tab("💹 Financials"):
             financials_md = gr.Markdown("", elem_id="result-box")
-
 
         with gr.Tab("👤 Leadership & Ownership"):
             leadership_md = gr.Markdown("", elem_id="result-box")
@@ -372,11 +338,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
             export_btn = gr.Button("Generate Markdown Report")
             export_file = gr.File(label="Download Report (.md)")
 
-
-    # =========================
-    # Orchestration
-    # =========================
-
+    # -------- logic
     def analyze(company: str):
         rows, _ = fetch_news_combined(company)  # usually []
 
@@ -426,7 +388,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
             sources_block,
             risks_overview_block   # risks_overview_md
         )
-
 
     start_button.click(
         fn=analyze,
@@ -499,7 +460,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
             f.write(content)
         return path
 
-
     export_btn.click(
         fn=export_markdown,
         inputs=[
@@ -520,10 +480,8 @@ with gr.Blocks(theme=gr.themes.Soft(), css="""
         show_progress=True
     )
 
-
 def main():
     app.launch()
-
 
 if __name__ == "__main__":
     main()
