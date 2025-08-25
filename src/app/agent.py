@@ -3,10 +3,12 @@ import os
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 
+from app.tools import TOOLS
+
 load_dotenv()
 
 # --- Force AI Studio API-key auth; disable ADC/GCloud envs ---
-API_KEY = os.getenv("GOOGLE_API_KEY") or "AIzaSyDUQ-EdjWtLZzvHwcFmEt0skdlFE-VRSwk"
+API_KEY = os.getenv("GOOGLE_API_KEY")
 os.environ["GOOGLE_API_KEY"] = API_KEY
 for var in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_AUTH_TOKEN", "GOOGLE_CLOUD_PROJECT"):
     os.environ.pop(var, None)
@@ -118,11 +120,16 @@ Do not include any prose before the JSON. Do not wrap the JSON in extra text. En
 When evidence is insufficient, prefer "Insufficient Data" over "No Go" and add targeted research_gaps with specific queries.
 """
 
-# Single model instance (no tools)
 llm = init_chat_model(
     "gemini-2.5-flash",
     model_provider="google_genai",
     api_key=os.environ["GOOGLE_API_KEY"],
+)
+
+from langgraph.prebuilt import create_react_agent
+llm_ai_agent = create_react_agent(
+    model = llm,
+    tools = TOOLS
 )
 
 def _coerce_content_to_text(content) -> str:
