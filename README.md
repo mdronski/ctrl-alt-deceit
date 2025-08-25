@@ -21,6 +21,9 @@ Create local *.env* file and define API keys env variables there
 ```bash
 TAVILY_API_KEY="YOUR_API_KEY"
 GOOGLE_API_KEY="YOUR_API_KEY"
+FINNHUB_API_KEY="YOUR_API_KEY"
+GNEWS_API_KEY="YOUR_API_KEY"
+NEWSAPI_API_KEY="YOUR_API_KEY"
 ```
 
 ## Run application
