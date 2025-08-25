@@ -121,7 +121,7 @@ Gather all publicly available and credible information about the target company 
 Include the following categories:
 - Basic facts (industry, size, location, year founded).
 - Financial performance and growth trends.
-- Leadership and ownership details.
+- Leadership and ownership details with their controversies. 
 - Reputation (reviews, press, social media sentiment).
 - Legal or regulatory issues (lawsuits, sanctions, investigations).
 - Partnerships and major clients.
