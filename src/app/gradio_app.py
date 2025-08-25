@@ -298,7 +298,7 @@ def fetch_news(company: str):
                 })
 
         except Exception as e:
-            errors.append(f"{tool_fn.__name__} failed: {str(e)}")
+            errors.append(f"{tool_fn.name} failed: {str(e)}")
 
     print(f"Total articles fetched: {len(articles_all)}")
 
@@ -316,7 +316,6 @@ def fetch_news(company: str):
 # =========================
 # Visualization + timeline
 # =========================
-
 def make_sentiment_pie(rows):
     counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
     for row in rows:
@@ -327,23 +326,33 @@ def make_sentiment_pie(rows):
 
     labels = [f"{k} ({v})" for k, v in counts.items() if v > 0]
     values = [v for v in counts.values() if v > 0]
-    colors_map = {"Positive": "green", "Neutral": "blue", "Negative": "red"}
+    colors_map = {
+        "Positive": "#4CAF50",
+        "Neutral": "#9E9E9E",
+        "Negative": "#F44336",
+    }
     colors = [colors_map[k] for k in counts if counts[k] > 0]
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.pie(
+    fig, ax = plt.subplots(figsize=(3, 3), facecolor="white")
+    wedges, texts, autotexts = ax.pie(
         values,
         labels=labels,
         autopct="%1.0f%%",
         startangle=140,
         colors=colors,
-        explode=[0.05] * len(values),
-        shadow=True,
-        wedgeprops={'edgecolor': 'black'}
+        wedgeprops={"edgecolor": "white", "linewidth": 2},
+        textprops={"fontsize": 10, "color": "black"},
     )
+
+    for autotext in autotexts:
+        autotext.set_fontsize(12)
+        autotext.set_color("white")
+        autotext.set_weight("bold")
+
     ax.axis("equal")
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
     plt.close(fig)
     buf.seek(0)
     return buf
